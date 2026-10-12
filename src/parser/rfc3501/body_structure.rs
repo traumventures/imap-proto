@@ -131,6 +131,9 @@ fn body_lang(i: &[u8]) -> IResult<&[u8], Option<Vec<Cow<'_, str>>>> {
 fn body_param(i: &[u8]) -> IResult<&[u8], BodyParams<'_>> {
     alt((
         map(nil, |_| None),
+        // RFC 3501 requires NIL for "no parameters", but Proton Mail Bridge
+        // sends an empty list `()`. Treat both the same.
+        map(tag("()"), |_| None),
         map(
             parenthesized_nonempty_list(map(
                 (string_utf8, tag(" "), string_utf8),
@@ -490,6 +493,23 @@ mod tests {
                     },
                     extension: None,
                 })
+            }
+        );
+    }
+
+    #[test]
+    fn test_body_structure_empty_disposition_params() {
+        // Proton Mail Bridge sends `()` instead of NIL for a disposition without
+        // parameters; RFC 3501 only allows NIL there, but the meaning is the same.
+        const BODY: &[u8] = br#"("text" "plain" ("charset" "utf-8") NIL NIL "quoted-printable" 13115 420 NIL ("inline" ()) NIL NIL)"#;
+
+        assert_matches!(
+            body(BODY),
+            Ok((_, BodyStructure::Text { common, .. })) => {
+                assert_eq!(common.disposition, Some(ContentDisposition {
+                    ty: Cow::Borrowed("inline"),
+                    params: None,
+                }));
             }
         );
     }
