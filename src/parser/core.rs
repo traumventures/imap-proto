@@ -1,8 +1,8 @@
 use nom::Parser;
 use nom::{
     branch::alt,
-    bytes::streaming::{escaped, tag, tag_no_case, take, take_while, take_while1},
-    character::streaming::{char, digit1, one_of, space0},
+    bytes::streaming::{tag, tag_no_case, take, take_while, take_while1},
+    character::streaming::{char, digit1, space0},
     combinator::{map, map_res, opt},
     multi::{separated_list0, separated_list1},
     sequence::{delimited, preceded},
@@ -77,20 +77,35 @@ pub fn string_utf8(i: &[u8]) -> IResult<&[u8], Cow<'_, str>> {
 }
 
 // quoted = DQUOTE *QUOTED-CHAR DQUOTE
+//
+// RFC 3501 only allows `\"` and `\\` as escapes. Real servers emit a lone
+// backslash followed by any other byte: Proton Mail Bridge writes a display
+// name such as "Jo 🙋\u200d♀️" with a literal `\u200d`. Rejecting it fails the
+// whole FETCH and desyncs the stream, so a backslash escapes exactly the next
+// byte, whatever it is. `\"` still never ends the string. The returned bytes
+// are the raw content between the quotes, escapes included, as before.
 pub fn quoted(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    delimited(
-        char('"'),
-        alt((
-            escaped(
-                take_while1(|byte| is_text_char(byte) && !is_quoted_specials(byte)),
-                '\\',
-                one_of("\\\""),
-            ),
-            tag(&b""[..]),
-        )),
-        char('"'),
-    )
-    .parse(i)
+    let (rest, _) = char('"').parse(i)?;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index] {
+            b'\\' => {
+                if index + 1 >= rest.len() {
+                    return Err(nom::Err::Incomplete(nom::Needed::new(1)));
+                }
+                index += 2;
+            }
+            b'"' => return Ok((&rest[index + 1..], &rest[..index])),
+            byte if is_text_char(byte) => index += 1,
+            _ => {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    &rest[index..],
+                    nom::error::ErrorKind::Char,
+                )))
+            }
+        }
+    }
+    Err(nom::Err::Incomplete(nom::Needed::new(1)))
 }
 
 // quoted bytes as utf8 — lossy, see comment on string_utf8.
@@ -286,10 +301,25 @@ mod tests {
             Ok((&b"???"[..], &br#"Hello \\ "#[..]))
         );
 
-        // Not allowed escapes...
-        assert!(quoted(br#""Hello \a "???"#).is_err());
-        assert!(quoted(br#""Hello \z "???"#).is_err());
-        assert!(quoted(br#""Hello \? "???"#).is_err());
+        // A lone backslash before any other byte is kept literally (real
+        // servers send it, see `quoted`); it is not an error.
+        assert_eq!(
+            quoted(br#""Hello \a "???"#),
+            Ok((&b"???"[..], &br#"Hello \a "#[..]))
+        );
+        assert_eq!(
+            quoted(br#""Hello \? "???"#),
+            Ok((&b"???"[..], &br#"Hello \? "#[..]))
+        );
+        // Proton Mail Bridge: a literal `\u200d` inside a UTF-8 display name.
+        let proton = "\"Juli \u{1F64B}\\u200d\u{2640}\u{FE0F}\" NIL";
+        assert_eq!(
+            quoted(proton.as_bytes()),
+            Ok((
+                &b" NIL"[..],
+                "Juli \u{1F64B}\\u200d\u{2640}\u{FE0F}".as_bytes()
+            ))
+        );
 
         let (rem, val) = quoted(br#""Hello \"World\""???"#).unwrap();
         assert_eq!(rem, br#"???"#);
