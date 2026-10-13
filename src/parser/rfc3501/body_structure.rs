@@ -173,9 +173,14 @@ fn body_disposition(i: &[u8]) -> IResult<&[u8], Option<ContentDisposition<'_>>> 
 fn body_type_basic(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
     map(
         (
-            string_utf8,
+            // RFC 3501 requires media type and subtype strings, but Proton Mail
+            // Bridge sends NIL NIL for an attachment without Content-Type. Such
+            // a part is an opaque file, so read it as APPLICATION/OCTET-STREAM.
+            map(nstring_utf8, |ty| ty.unwrap_or(Cow::Borrowed("APPLICATION"))),
             tag(" "),
-            string_utf8,
+            map(nstring_utf8, |subtype| {
+                subtype.unwrap_or(Cow::Borrowed("OCTET-STREAM"))
+            }),
             tag(" "),
             body_fields,
             body_ext_1part,
@@ -249,7 +254,9 @@ fn body_type_message(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
             body_fields,
             tag(" "),
             envelope,
-            tag(" "),
+            // RFC 3501 requires SP between envelope and body, but Proton Mail
+            // Bridge omits it for an attached message: `...")("application" ...`.
+            opt(tag(" ")),
             body,
             tag(" "),
             number,
@@ -524,6 +531,36 @@ mod tests {
         assert_matches!(
             body(body_str.as_bytes()),
             Ok((_, BodyStructure::Message { .. }))
+        );
+    }
+
+    #[test]
+    fn test_body_structure_message_without_space_before_body() {
+        // Proton Mail Bridge omits the SP between the envelope and the body of
+        // an attached message/rfc822 part.
+        let (text_body_str, _) = mock_body_text();
+        let envelope_str = r#"("Wed, 17 Jul 1996 02:23:25 -0700 (PDT)" "subject" NIL NIL NIL NIL NIL NIL NIL "<id@example.com>")"#;
+        let body_str =
+            format!(r#"("MESSAGE" "RFC822" {BODY_FIELDS} {envelope_str}{text_body_str} 42)"#);
+
+        assert_matches!(
+            body(body_str.as_bytes()),
+            Ok((_, BodyStructure::Message { lines: 42, .. }))
+        );
+    }
+
+    #[test]
+    fn test_body_structure_basic_without_media_type() {
+        // Proton Mail Bridge sends NIL NIL for an attachment without Content-Type.
+        const BODY: &[u8] = br#"(NIL NIL ("filename" "entry_qr.png") NIL NIL "base64" 6464 NIL ("attachment" ("filename" "entry_qr.png")) NIL NIL)"#;
+
+        assert_matches!(
+            body(BODY),
+            Ok((_, BodyStructure::Basic { common, other, .. })) => {
+                assert_eq!(common.ty.ty, "APPLICATION");
+                assert_eq!(common.ty.subtype, "OCTET-STREAM");
+                assert_eq!(other.octets, 6464);
+            }
         );
     }
 
